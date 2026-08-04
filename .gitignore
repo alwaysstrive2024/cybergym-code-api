@@ -1,5 +1,15 @@
 /tmp/
+
+# Local benchmark datasets and downloaded runner data (never commit).
+/cybergym_data*/
+/datasets/
+/data/
+/.binary-eval-download/
+
+# Evaluation artifacts and local service state.
 /out/
+/outputs/
+/.runs/
 .vscode/
 /logs/
 /cybergym_data/
@@ -143,7 +153,12 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
+*.secret
+secrets/
 .venv
+.venv-*/
 env/
 venv/
 ENV/

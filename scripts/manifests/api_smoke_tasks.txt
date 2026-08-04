@@ -1,0 +1,3 @@
+# Small, locally prepared CyberGym source subset for API compatibility/cost smoke tests.
+arvo:1461
+arvo:65212
