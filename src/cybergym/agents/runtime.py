@@ -16,10 +16,12 @@ from uuid import uuid4
 import httpx
 
 import docker
+from cybergym.agents.context import ContextLedger
 
 LOG = logging.getLogger("cybergym.agent_runtime")
 MAX_FILE_BYTES = 1_000_000
-DEFAULT_MAX_TOOL_RESULT_CHARS = 32_768
+MAX_READ_FILE_CHARS = 16_000
+DEFAULT_MAX_TOOL_RESULT_CHARS = 12_288
 
 
 def utc_now() -> str:
@@ -165,14 +167,24 @@ class TaskSandbox:
         self,
         path: str,
         start_line: int = 1,
-        max_lines: int = 200,
-        max_chars: int = MAX_FILE_BYTES,
+        max_lines: int = 160,
+        max_chars: int = MAX_READ_FILE_CHARS,
     ) -> str:
         if start_line < 1 or max_lines < 1:
             raise ValueError("start_line and max_lines must be positive")
         text = self.read_file_bytes(path).decode("utf-8", errors="replace")
-        selected = "".join(text.splitlines(keepends=True)[start_line - 1 : start_line - 1 + max_lines])
-        return selected[:max_chars]
+        limit = min(max_lines, 400)
+        char_limit = min(max_chars, MAX_READ_FILE_CHARS)
+        numbered: list[str] = []
+        used = 0
+        for number, line in enumerate(text.splitlines()[start_line - 1 : start_line - 1 + limit], start=start_line):
+            rendered = f"{number:>6}\t{line}\n"
+            if used + len(rendered) > char_limit:
+                numbered.append("[truncated; request a narrower line range]\n")
+                break
+            numbered.append(rendered)
+            used += len(rendered)
+        return "".join(numbered)
 
     def write_file(self, path: str, content: str) -> int:
         relative, _ = self._container_path(path)
@@ -250,6 +262,8 @@ class ToolExecutor:
         self.submissions: list[dict[str, Any]] = []
         self.tool_result_index = 0
         self.tool_results_dir = self.trajectory_path.parent / "tool-results"
+        self.context_ledger = ContextLedger()
+        self.working_memory_path = self.trajectory_path.parent / "working-memory.md"
 
     def record(self, event: dict[str, Any]) -> None:
         with self.trajectory_path.open("a", encoding="utf-8") as handle:
@@ -265,8 +279,8 @@ class ToolExecutor:
         self,
         path: str,
         start_line: int = 1,
-        max_lines: int = 200,
-        max_chars: int = MAX_FILE_BYTES,
+        max_lines: int = 160,
+        max_chars: int = MAX_READ_FILE_CHARS,
     ) -> str:
         try:
             return self.sandbox.read_file(path, start_line, max_lines, max_chars)
@@ -279,6 +293,17 @@ class ToolExecutor:
         except ValueError as exc:
             return f"error: {exc}"
         return f"wrote {size} bytes to {path}"
+
+    def save_checkpoint(self, summary: str, next_hypothesis: str = "") -> str:
+        """Persist concise evidence across compaction and Claude SDK session resets."""
+        try:
+            self.context_ledger.add_checkpoint(summary, next_hypothesis)
+        except ValueError as exc:
+            return f"error: {exc}"
+        return "checkpoint saved to durable working memory"
+
+    def working_memory(self) -> str:
+        return self.context_ledger.render()
 
     def run_command(self, command: str, timeout_seconds: int = 120) -> str:
         if not command.strip():
@@ -346,7 +371,7 @@ class ToolExecutor:
         omitted = len(result) - self.max_tool_result_chars
         bounded = (
             result[:head_chars]
-            + f"\n\n[... {omitted} characters omitted from model context; full output saved in run artifacts ...]\n\n"
+            + f"\n\n[... {omitted} characters omitted; full output is in host run artifacts. Rerun a narrower query for omitted evidence ...]\n\n"
             + result[-tail_chars:]
         )
         metadata = {
@@ -367,6 +392,7 @@ class ToolExecutor:
             "list_files": self.list_files,
             "read_file": self.read_file,
             "write_file": self.write_file,
+            "save_checkpoint": self.save_checkpoint,
             "run_command": self.run_command,
             "submit_poc": self.submit_poc,
         }
@@ -380,6 +406,8 @@ class ToolExecutor:
         except Exception as exc:  # The model needs a bounded, observable tool error.
             LOG.exception("tool %s failed", name)
             result = f"error: {type(exc).__name__}: {exc}"
+        self.context_ledger.observe_tool(name, arguments, result)
+        self.working_memory_path.write_text(self.context_ledger.render() + "\n", encoding="utf-8")
         bounded_result, result_metadata = self._bounded_result(name, result)
         self.record(
             {
