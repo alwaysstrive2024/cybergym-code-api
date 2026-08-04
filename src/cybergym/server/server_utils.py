@@ -1,18 +1,20 @@
 import hashlib
+import io
 import json
-import os
 import shlex
+import tarfile
+import threading
 from enum import IntEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from uuid import uuid4
 
-import docker
 import requests
 from docker.errors import DockerException
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+import docker
 from cybergym.server.pocdb import PoCRecord, get_or_create_poc, get_poc_by_hash, update_poc_output
 from cybergym.server.types import Payload, server_conf
 from cybergym.task.mask import _reverse_map, unmask_task_id
@@ -23,6 +25,12 @@ FLAG = "flag{3xpl017_cyb3r6ym}"
 DEFAULT_DOCKER_TIMEOUT = 60  # seconds for docker container to run
 DEFAULT_CMD_TIMEOUT = 10  # seconds for command to run
 DEFAULT_RUNNER_IMAGE = "cybergym/oss-fuzz-base-runner:latest"
+
+# Verification requests can arrive concurrently.  Keep a single pull in
+# flight for each image so several requests for a previously-unseen task do
+# not all start downloading the same image.
+_image_pull_locks: dict[str, threading.Lock] = {}
+_image_pull_locks_guard = threading.Lock()
 
 
 class CustomExitCode(IntEnum):
@@ -59,12 +67,73 @@ def _image_and_command_from_task_id(task_id: str, mode: str) -> tuple[str, list[
     return image, command
 
 
+def _ensure_local_image(client: docker.DockerClient, image: str) -> None:
+    """Ensure ``image`` is present on the Docker daemon used by the server.
+
+    ``containers.create`` does not pull a missing image.  This matters for
+    tasks outside a pre-downloaded subset: Docker Hub can serve the tag while
+    the verifier still fails locally with a 404.  Pull only after a local
+    lookup misses, and re-check while holding a per-image lock.
+    """
+    try:
+        client.images.get(image)
+        return
+    except docker.errors.ImageNotFound:
+        pass
+
+    with _image_pull_locks_guard:
+        lock = _image_pull_locks.setdefault(image, threading.Lock())
+
+    with lock:
+        try:
+            client.images.get(image)
+            return
+        except docker.errors.ImageNotFound:
+            repository, tag = docker.utils.parse_repository_tag(image)
+            client.images.pull(repository, tag=tag, auth_config={})
+            # A successful pull response is not a substitute for checking the
+            # exact tag the container will use (notably with remote daemons).
+            client.images.get(image)
+
+
 def is_integer(s):
     try:
         int(s)
         return True
     except ValueError:
         return False
+
+
+def _stage_path(container, source: Path, destination: str) -> None:
+    """Copy a local file or directory into a container without a host bind mount.
+
+    The benchmark server may talk to a Docker daemon on another host.  Such a
+    daemon cannot see the server's local paths, so Docker API archive transfer
+    is the only portable way to provide validation inputs.
+    """
+    source = source.resolve()
+    if not source.exists():
+        raise FileNotFoundError(f"staging source does not exist: {source}")
+    target = PurePosixPath(destination)
+    if not target.is_absolute() or target.name in {"", ".", ".."}:
+        raise ValueError(f"destination must name an absolute file or directory: {destination}")
+    parent = str(target.parent)
+    mkdir = container.exec_run(["/bin/mkdir", "-p", parent], stdout=True, stderr=True)
+    if mkdir.exit_code != 0:
+        output = mkdir.output.decode("utf-8", errors="replace") if mkdir.output else ""
+        raise RuntimeError(f"failed to create staging directory {parent}: {output}")
+    archive_bytes = io.BytesIO()
+    with tarfile.open(fileobj=archive_bytes, mode="w") as archive:
+        archive.add(source, arcname=target.name, recursive=True)
+    archive_bytes.seek(0)
+    if not container.put_archive(parent, archive_bytes):
+        raise RuntimeError(f"failed to stage {source} at {destination}")
+
+
+def _run_staged_command(container, cmd: list[str], cmd_timeout: int) -> tuple[int, bytes]:
+    shell_cmd = ["/bin/bash", "-c", f"timeout -s SIGKILL {cmd_timeout} {shlex.join(cmd)} 2>&1"]
+    result = container.exec_run(shell_cmd, stdout=True, stderr=False)
+    return result.exit_code, result.output or b""
 
 
 def run_container(
@@ -75,27 +144,24 @@ def run_container(
     cmd_timeout: int = DEFAULT_CMD_TIMEOUT,
 ):
     image, cmd = _image_and_command_from_task_id(task_id, mode)
-    cmd = ["/bin/bash", "-c", f"timeout -s SIGKILL {cmd_timeout} {shlex.join(cmd)} 2>&1"]
     client = docker.from_env()
     container = None
     try:
-        # Split create + start so we always have a container ref for cleanup.
-        # containers.run(detach=True) internally does create+start, but if start
-        # fails the container ref is lost and the container leaks in "created" state.
+        _ensure_local_image(client, image)
+        # Start an idle target-image container, then transfer the PoC over the
+        # Docker API. A bind mount would resolve on a remote daemon's host,
+        # where the server's local poc_path does not exist.
         container = client.containers.create(
             image=image,
-            command=cmd,
+            command=["sleep", "infinity"],
             network_mode="none",
-            volumes={str(poc_path.absolute()): {"bind": "/tmp/poc", "mode": "ro"}},  # noqa: S108
         )
         container.start()
-        out = container.logs(stdout=True, stderr=False, stream=True, follow=True)
-        exit_code = container.wait(timeout=docker_timeout)["StatusCode"]
+        _stage_path(container, poc_path, "/tmp/poc")  # noqa: S108 -- isolated short-lived container path
+        exit_code, docker_output = _run_staged_command(container, cmd, cmd_timeout)
         if exit_code == 137:  # Process killed by timeout
             exit_code = CustomExitCode.Timeout
             docker_output = b""
-        else:
-            docker_output = b"".join(out)
     except requests.exceptions.ReadTimeout:
         raise HTTPException(status_code=500, detail="Timeout waiting for the program") from None
     except DockerException as e:
@@ -120,7 +186,6 @@ def run_container_binary(
     client = docker.from_env()
     subset, subid = task_id.split(":")
     cmd: list[str]
-    volumes: dict[str, dict[str, str]]
     runner_image: str = DEFAULT_RUNNER_IMAGE
     container = None
 
@@ -129,25 +194,6 @@ def run_container_binary(
         if runner_image_file.exists():
             runner_image = runner_image_file.read_text().strip()
         bin_dir = data_dir / "arvo" / subid / mode
-        volumes = {
-            str(bin_dir / "arvo"): {
-                "bind": "/arvo",
-                "mode": "ro",
-            },
-            str(poc_path.absolute()): {
-                "bind": "/tmp/poc",  # noqa: S108
-                "mode": "ro",
-            },
-            str(bin_dir / "libs"): {
-                "bind": "/out-libs",
-                "mode": "ro",
-            },
-        }
-        for file in (bin_dir / "out").iterdir():
-            volumes[str(file)] = {
-                "bind": f"/out/{file.name}",
-                "mode": "ro",
-            }
         cmd = ["env", "LD_LIBRARY_PATH=/out-libs", "/bin/bash", "/arvo"]
     elif subset == "oss-fuzz":
         if not is_integer(subid):
@@ -158,30 +204,32 @@ def run_container_binary(
         with open(meta_file) as f:
             metadata = json.load(f)
         fuzzer_name = metadata["fuzz_target"]
-        volumes = {str(poc_path.absolute()): {"bind": "/testcase", "mode": "ro"}}
-        for subfile in out_dir.iterdir():
-            host_path = str(subfile.absolute())
-            container_path = os.path.join("/out", subfile.name)
-            volumes[host_path] = {"bind": container_path, "mode": "ro"}
         cmd = ["reproduce", fuzzer_name]
     else:
         raise HTTPException(status_code=400, detail="Invalid task_id format")
 
     try:
+        _ensure_local_image(client, runner_image)
         container = client.containers.create(
             image=runner_image,
-            command=["/bin/bash", "-c", f"timeout -s SIGKILL {cmd_timeout} {shlex.join(cmd)} 2>&1"],
+            command=["sleep", "infinity"],
             network_mode="none",
-            volumes=volumes,
         )
         container.start()
-        out = container.logs(stdout=True, stderr=False, stream=True, follow=True)
-        exit_code = container.wait(timeout=docker_timeout)["StatusCode"]
+        if subset == "arvo":
+            _stage_path(container, bin_dir / "arvo", "/arvo")
+            _stage_path(container, poc_path, "/tmp/poc")  # noqa: S108 -- isolated short-lived container path
+            _stage_path(container, bin_dir / "libs", "/out-libs")
+            for file in (bin_dir / "out").iterdir():
+                _stage_path(container, file, f"/out/{file.name}")
+        else:
+            _stage_path(container, poc_path, "/testcase")
+            for subfile in out_dir.iterdir():
+                _stage_path(container, subfile, f"/out/{subfile.name}")
+        exit_code, docker_output = _run_staged_command(container, cmd, cmd_timeout)
         if exit_code == 137:  # Process killed by timeout
             exit_code = CustomExitCode.Timeout
             docker_output = b""
-        else:
-            docker_output = b"".join(out)
     except requests.exceptions.ReadTimeout:
         raise HTTPException(status_code=500, detail="Timeout waiting for the program") from None
     except DockerException as e:

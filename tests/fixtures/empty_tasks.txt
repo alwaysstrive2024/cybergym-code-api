@@ -1,0 +1,1 @@
+# Intentionally empty task manifest for supervisor startup tests.

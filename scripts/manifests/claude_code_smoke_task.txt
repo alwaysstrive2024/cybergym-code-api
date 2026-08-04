@@ -1,0 +1,2 @@
+# One-task end-to-end smoke test for the Claude Code Agent backend.
+arvo:1461

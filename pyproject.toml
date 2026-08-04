@@ -20,10 +20,13 @@ build-backend = "hatchling.build"
 
 [project.optional-dependencies]
 agent = [
+    "claude-agent-sdk>=0.1.58",
     "docker>=7.1.0",
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
     "langgraph>=1.2.9",
     "openai>=2.48.0",
+    "uvicorn>=0.34.0",
 ]
 dev = [
     # Add your development dependencies here
