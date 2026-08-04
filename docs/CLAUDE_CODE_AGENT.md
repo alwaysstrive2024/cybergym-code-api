@@ -10,18 +10,29 @@ Claude Code 模式通过仅监听 `127.0.0.1` 的批次级协议桥，将 Anthro
 获得临时网关凭证，不获得上游 API key。它只能调用五个 in-process MCP 工具；文件与
 命令操作继续在无网络、降权的 Docker sandbox 中执行。
 
-## DeepSeek 单任务 smoke test
+## 直接启动 DeepSeek smoke test
 
 ```bash
 cd /root/cybergym
 uv sync --extra agent --extra server
-export CYBERGYM_DEEPSEEK_API_KEY='你的key'
+export CYBERGYM_DEEPSEEK_API_KEY='你的模型服务key'
 
-bash scripts/evaluation/run_api_subset.sh \
-  scripts/profiles/deepseek-v4-claude-code.env \
-  scripts/manifests/claude_code_smoke_task.txt \
-  deepseek-v4-claude-code-smoke-r1
+USE_CLAUDE_CODE_AGENT=true bash scripts/evaluation/run_api_subset.sh \
+  scripts/profiles/deepseek-v4.env \
+  scripts/manifests/api_smoke_tasks.txt \
+  claudecode-agent-deepseek-v4
 ```
+
+这条命令不需要设置 `CYBERGYM_API_KEY`，也不需要手动启动或填写 CyberGym Server
+地址。入口脚本会为该批次：
+
+1. 生成只存在于进程环境中的临时 CyberGym 管理 Key；
+2. 选择空闲的 loopback 端口并启动本地 CyberGym Server；
+3. 把自动得到的 `http://127.0.0.1:<port>` 传给 Agent 和最终验证程序；
+4. 结束时关闭本批次启动的 Server 和 Claude 协议桥。
+
+模型服务 Key 仍然只放在本地环境变量 `CYBERGYM_DEEPSEEK_API_KEY` 中，不会写入
+profile、轨迹或 Git。
 
 也可以在已有 OpenAI-compatible profile 前覆盖开关；命令仍然只有三个位置参数：
 
@@ -42,3 +53,24 @@ Claude Code 模式默认同步调用 `/submit-diff`，因此每次 PoC 提交立
 fixed 两侧输出。使用非 Claude 模型驱动 Claude Code runtime 属于实验性、非 Anthropic
 官方支持的组合；协议桥为 DeepSeek thinking tool-call 回合保留一次性
 `reasoning_content`，但不会把它写入轨迹或作为可见文本返回给 Agent。
+
+## 连接已有 CyberGym Server
+
+默认无需连接已有 Server。如果赛事方提供了远程验证服务，则显式设置服务地址和赛事方
+提供的管理 Key，入口脚本不会再启动本地 Server：
+
+```bash
+export CYBERGYM_SERVER_URL='https://cybergym.example.com'
+export CYBERGYM_API_KEY='赛事方提供的key'
+
+USE_CLAUDE_CODE_AGENT=true bash scripts/evaluation/run_api_subset.sh \
+  scripts/profiles/deepseek-v4.env \
+  scripts/manifests/api_smoke_tasks.txt \
+  claudecode-agent-deepseek-v4-remote
+```
+
+## 同时运行多个模型
+
+每个不同的 batch name 都有独立的随机端口、临时网关令牌、Server 数据库、日志和输出
+目录，因此可以并行启动。不要复用同一个 batch name，也不要为多个进程手动指定同一个
+`CYBERGYM_SERVER_PORT`。dataset 和 Docker image 可以共享。

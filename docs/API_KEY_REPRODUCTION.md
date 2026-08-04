@@ -1,4 +1,4 @@
-# API Key 方式复现与执行
+# Claude Code + API Key 复现与执行
 
 这份最小交付使用 OpenAI-compatible Chat Completions API 运行 CyberGym。仓库只保存
 API 地址、模型名和“读取哪个环境变量”，不会保存 API Key 本身。更换 Key 时无需改代码。
@@ -12,7 +12,7 @@ uv sync --extra agent --extra server
 docker build -t cybergym-langgraph-agent:0.1 docker/langgraph-agent
 ```
 
-CyberGym dataset 不包含在 Git 仓库中。按项目根目录 `README.md` 下载后，默认应位于：
+CyberGym dataset 不包含在 Git 仓库中。同伴从 Harbor 下载并解压后，默认应放在：
 
 ```text
 cybergym_data/data/
@@ -23,17 +23,17 @@ cybergym_data/data/
 
 ## 2. 更换 API Key
 
-在当前终端导出同伴自己的新 Key：
+在当前终端导出本地保存的 DeepSeek 模型服务 Key：
 
 ```bash
-export CYBERGYM_MODEL_API_KEY='替换为新的模型 API Key'
+export CYBERGYM_DEEPSEEK_API_KEY='替换为本地模型服务 Key'
 ```
 
-不要把真实 Key 写入 `scripts/profiles/api-reproduction.env`、命令脚本、文档或 Git。
+不要把真实 Key 写入 `scripts/profiles/deepseek-v4.env`、命令脚本、文档或 Git。
 profile 中的关键配置是：
 
 ```bash
-API_KEY_ENV="CYBERGYM_MODEL_API_KEY"
+API_KEY_ENV="CYBERGYM_DEEPSEEK_API_KEY"
 ```
 
 运行器通过该名称读取 `os.environ`，并仅在内存中传给
@@ -42,31 +42,32 @@ API_KEY_ENV="CYBERGYM_MODEL_API_KEY"
 
 如果需要切换 API 服务或模型，只修改 profile 中的 `API_BASE_URL` 和 `API_MODEL`。
 
-## 3. 执行 smoke 测试
+## 3. 直接启动 Claude Code + DeepSeek smoke 测试
 
 ```bash
-bash scripts/evaluation/run_api_reproduction.sh \
-  scripts/profiles/api-reproduction.env \
+USE_CLAUDE_CODE_AGENT=true bash scripts/evaluation/run_api_subset.sh \
+  scripts/profiles/deepseek-v4.env \
   scripts/manifests/api_smoke_tasks.txt \
-  teammate-smoke-r1
+  claudecode-agent-deepseek-v4
 ```
 
-脚本会启动本地 CyberGym 验证服务、依次运行任务、验证 PoC，并将结果写入
-`outputs/teammate-smoke-r1/`。重复执行同一批次名时，已完成任务会跳过。
+无需设置 `CYBERGYM_API_KEY`。脚本会自动生成临时管理 Key、选择空闲端口、启动本地
+CyberGym 验证服务、把服务地址传给 Agent、依次验证 PoC，并将结果写入
+`outputs/claudecode-agent-deepseek-v4/`。重复执行同一批次名时，已完成任务会跳过。
 
-若验证服务已在其他位置运行，可设置：
+如果赛事方提供远程 CyberGym Server，则改为同时设置地址和赛事方 Key：
 
 ```bash
-export CYBERGYM_SERVER_URL='http://127.0.0.1:18666'
+export CYBERGYM_SERVER_URL='https://cybergym.example.com'
+export CYBERGYM_API_KEY='赛事方提供的管理 Key'
 ```
 
 `CYBERGYM_API_KEY` 是 CyberGym 验证服务自身的管理 Key，与模型服务的
-`CYBERGYM_MODEL_API_KEY` 不同。本地模式会为每批自动生成临时管理 Key；连接远程
-验证服务时，需要在服务端和运行端设置相同的新值：
+`CYBERGYM_DEEPSEEK_API_KEY` 不同。本地模式会为每批自动生成临时管理 Key；连接远程
+验证服务时才需要赛事方提供。
 
-```bash
-export CYBERGYM_API_KEY='替换为新的验证服务管理 Key'
-```
+多个模型可以同时运行：为每个进程使用不同的 batch name 即可。每个本地批次会使用
+独立的空闲端口、临时 Key、数据库、日志和输出目录；dataset 与 Docker images 可以共享。
 
 ## 4. 结果检查
 

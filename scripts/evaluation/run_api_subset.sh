@@ -43,6 +43,28 @@ case "${USE_CLAUDE_CODE_AGENT}" in
     true|false) ;;
     *) echo "USE_CLAUDE_CODE_AGENT must be exactly true or false" >&2; exit 2 ;;
 esac
+[[ -x "${repo_root}/.venv/bin/python" ]] || {
+    echo "Missing .venv; run: uv sync --extra agent --extra server" >&2
+    exit 2
+}
+[[ -d "${data_dir}" ]] || {
+    echo "CyberGym dataset is missing: ${data_dir}" >&2
+    exit 2
+}
+
+# A locally launched verifier needs a shared management credential, but it is
+# an implementation detail of this batch. Generate it in memory and pass it to
+# the server and verification subprocesses through their inherited environment.
+# An explicitly configured remote verifier still requires the organizer's key.
+if [[ -z "${server_url}" ]]; then
+    if [[ -z "${CYBERGYM_API_KEY:-}" ]]; then
+        CYBERGYM_API_KEY="$("${repo_root}/.venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+        export CYBERGYM_API_KEY
+    fi
+elif [[ -z "${CYBERGYM_API_KEY:-}" ]]; then
+    echo "CYBERGYM_API_KEY is required when CYBERGYM_SERVER_URL points to an existing server" >&2
+    exit 2
+fi
 
 claude_bridge_pid=""
 claude_bridge_url=""
@@ -114,6 +136,7 @@ if [[ -z "${server_url}" ]]; then
         server_port="$(${repo_root}/.venv/bin/python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
     fi
     server_url="http://127.0.0.1:${server_port}"
+    echo "Starting isolated CyberGym server for batch ${batch_name} at ${server_url}"
     PORT="${server_port}" CYBERGYM_SERVER_RUN_DIR="${server_run_dir}" \
         bash "${repo_root}/scripts/serving/start_cybergym_server.sh" >"${server_run_dir}/launcher.log" 2>&1 &
     server_pid=$!
@@ -123,6 +146,8 @@ if [[ -z "${server_url}" ]]; then
         if ! kill -0 "${server_pid}" 2>/dev/null; then tail -n 80 "${server_run_dir}/launcher.log" >&2; exit 1; fi
         sleep 2
     done
+else
+    echo "Using existing CyberGym server at ${server_url}"
 fi
 curl --fail --silent --show-error --connect-timeout 2 "${server_url}/openapi.json" >/dev/null
 
