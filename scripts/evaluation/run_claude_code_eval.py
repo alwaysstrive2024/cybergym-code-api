@@ -36,6 +36,7 @@ from cybergym.task.types import TaskConfig, TaskDifficulty
 
 LOG = logging.getLogger("cybergym.claude_code_eval")
 FINALIZATION_ATTEMPTS = 3
+MAX_TURNS_SUBTYPE = "error_max_turns"
 
 CLAUDE_CODE_APPEND_PROMPT = """
 
@@ -268,14 +269,26 @@ async def consume_query(
 ) -> tuple[ResultMessage | None, dict[str, Any] | None]:
     result: ResultMessage | None = None
     last_assistant: dict[str, Any] | None = None
-    async for message in query(prompt=prompt, options=options):
-        serialized = serialize_message(message)
-        executor.record({"timestamp": utc_now(), "event": "claude_sdk_message", **serialized})
-        if isinstance(message, AssistantMessage):
-            last_assistant = serialized
-        if isinstance(message, ResultMessage):
-            result = message
+    try:
+        async for message in query(prompt=prompt, options=options):
+            serialized = serialize_message(message)
+            executor.record({"timestamp": utc_now(), "event": "claude_sdk_message", **serialized})
+            if isinstance(message, AssistantMessage):
+                last_assistant = serialized
+            if isinstance(message, ResultMessage):
+                result = message
+    except Exception:
+        # The SDK deliberately raises after yielding its structured max-turns
+        # result.  In this runner max_turns is a session boundary, not a task
+        # failure, so return the captured result and let run_agent rotate the
+        # session.  Every other SDK/transport error remains fatal.
+        if not result or result.subtype != MAX_TURNS_SUBTYPE:
+            raise
     return result, last_assistant
+
+
+def is_expected_session_boundary(result: ResultMessage | None) -> bool:
+    return bool(result and result.is_error and result.subtype == MAX_TURNS_SUBTYPE)
 
 
 async def run_agent(
@@ -319,7 +332,7 @@ async def run_agent(
             last_assistant = assistant or last_assistant
             used_turns = result.num_turns if result and result.num_turns else phase_turns
             remaining_turns -= min(phase_turns, used_turns)
-            if not result or result.is_error:
+            if not result or (result.is_error and not is_expected_session_boundary(result)):
                 break
 
         while not executor.submissions and finalization_attempts < FINALIZATION_ATTEMPTS:
@@ -340,7 +353,7 @@ async def run_agent(
             if result:
                 results.append(result)
             last_assistant = assistant or last_assistant
-            if not result or result.is_error:
+            if not result or (result.is_error and not is_expected_session_boundary(result)):
                 break
     return results, last_assistant, finalization_attempts
 
@@ -415,6 +428,7 @@ def main() -> int:
             difficulty=TaskDifficulty.level1,
             agent_id=agent_id,
             mask_map_path=Path("mask_map.json").resolve(),
+            stage_archives=True,
         )
     )
     json_dump(run_dir / "task.json", task.model_dump(mode="json"))
@@ -484,7 +498,14 @@ def main() -> int:
     )
 
     return_code = 0
-    summary: dict[str, Any]
+    summary: dict[str, Any] = {
+        "status": "failed",
+        "completed_at": utc_now(),
+        "agent_backend": "claude_code",
+        "error_type": "InterruptedBeforeSummary",
+        "error": "evaluation stopped before a final summary was produced",
+        "submissions": [],
+    }
     try:
         sandbox.start()
         results, last_assistant, finalization_attempts = asyncio.run(
@@ -497,11 +518,16 @@ def main() -> int:
             )
         )
         last_result = results[-1] if results else None
-        is_error = bool(last_result.is_error) if last_result else True
+        unexpected_errors = [
+            result for result in results if result.is_error and not is_expected_session_boundary(result)
+        ]
+        is_error = bool(unexpected_errors) or not results
         if executor.has_valid_differential_submission:
             termination_reason = "valid_differential_submission"
         elif not executor.submissions:
             termination_reason = "model_finished_without_submission"
+        elif last_result and is_expected_session_boundary(last_result):
+            termination_reason = "turn_budget_exhausted"
         elif last_result:
             termination_reason = last_result.terminal_reason or last_result.stop_reason or last_result.subtype
         else:
@@ -519,6 +545,14 @@ def main() -> int:
         }
         if is_error:
             return_code = 1
+    except asyncio.CancelledError:
+        summary.update(
+            completed_at=utc_now(),
+            error_type="CancelledError",
+            error="evaluation was cancelled",
+            submissions=executor.submissions,
+        )
+        raise
     except Exception as exc:
         LOG.exception("Claude Code evaluation failed")
         summary = {

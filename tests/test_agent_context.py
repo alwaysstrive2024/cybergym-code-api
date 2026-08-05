@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import json
 
-from cybergym.agents.context import ContextLedger, MEMORY_MARKER, compact_messages, sanitize_assistant_message
+from cybergym.agents.context import (
+    ContextLedger,
+    MEMORY_MARKER,
+    compact_messages,
+    is_context_overflow_error,
+    sanitize_assistant_message,
+)
 
 
 def test_compaction_keeps_memory_and_drops_complete_old_exchange() -> None:
@@ -44,3 +50,55 @@ def test_large_written_content_is_removed_after_tool_execution() -> None:
 
     assert len(arguments) < 200
     assert "poc.bin" in arguments
+
+
+def test_compaction_keeps_a_contiguous_recent_window() -> None:
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "old-small"},
+        {"role": "assistant", "content": "middle" * 400},
+        {"role": "assistant", "content": "new-small"},
+    ]
+
+    compacted, omitted = compact_messages(messages, 180, ContextLedger().render())
+
+    contents = [message.get("content") for message in compacted]
+    assert "new-small" in contents
+    assert "middle" * 400 not in contents
+    assert "old-small" not in contents
+    assert omitted == 2
+
+
+def test_ledger_deduplicates_repeated_evidence() -> None:
+    ledger = ContextLedger()
+    ledger.add_checkpoint("same fact")
+    ledger.add_checkpoint("same fact")
+    ledger.observe_tool("read_file", {"path": "source.c", "start_line": 10, "max_lines": 5}, "result")
+    ledger.observe_tool("read_file", {"path": "source.c", "start_line": 10, "max_lines": 5}, "result")
+
+    assert list(ledger.checkpoints) == ["Fact: same fact"]
+    assert list(ledger.reads) == ["source.c:L10-L14"]
+
+
+def test_compaction_removes_repeated_system_and_memory_messages() -> None:
+    ledger = ContextLedger()
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "task"},
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": ledger.render()},
+        {"role": "assistant", "content": "recent"},
+    ]
+
+    compacted, _ = compact_messages(messages, 300, ledger.render(), reserved_tokens=20)
+
+    assert sum(message.get("role") == "system" for message in compacted) == 1
+    assert sum(str(message.get("content", "")).startswith(MEMORY_MARKER) for message in compacted) == 1
+    assert compacted[-1]["content"] == "recent"
+
+
+def test_only_context_limit_errors_trigger_emergency_recovery() -> None:
+    assert is_context_overflow_error(RuntimeError("maximum context length exceeded"))
+    assert is_context_overflow_error(RuntimeError("prompt is too long"))
+    assert not is_context_overflow_error(RuntimeError("invalid API key"))

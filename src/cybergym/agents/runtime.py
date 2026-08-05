@@ -17,6 +17,7 @@ import httpx
 
 import docker
 from cybergym.agents.context import ContextLedger
+from cybergym.task.types import STAGED_ARCHIVES_MANIFEST
 
 LOG = logging.getLogger("cybergym.agent_runtime")
 MAX_FILE_BYTES = 1_000_000
@@ -31,6 +32,42 @@ def utc_now() -> str:
 def json_dump(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+
+
+def upload_task_workspace(task_dir: Path, container: Any, workspace: str) -> None:
+    """Upload normal task files plus read-only dataset archives from a staging manifest."""
+    manifest_path = task_dir / STAGED_ARCHIVES_MANIFEST
+    try:
+        staged_archives: dict[str, str] = {}
+        if manifest_path.is_file():
+            value = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or not all(
+                isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+            ):
+                raise RuntimeError("invalid staged archive manifest")
+            staged_archives = value
+        with tempfile.NamedTemporaryFile(prefix="cybergym-task-", suffix=".tar") as temporary:
+            with tarfile.open(temporary.name, mode="w") as archive:
+                for entry in sorted(task_dir.rglob("*")):
+                    arcname = str(entry.relative_to(task_dir))
+                    if entry == manifest_path:
+                        continue
+                    if entry.is_symlink():
+                        continue
+                    archive.add(entry, arcname=arcname, recursive=False)
+                for arcname, source_name in sorted(staged_archives.items()):
+                    archive_path = PurePosixPath(arcname)
+                    if archive_path.is_absolute() or ".." in archive_path.parts:
+                        raise RuntimeError(f"invalid staged archive destination: {arcname}")
+                    source = Path(source_name).resolve(strict=True)
+                    if not source.is_file():
+                        raise RuntimeError(f"staged archive is not a regular file: {source}")
+                    archive.add(source, arcname=arcname, recursive=False)
+            temporary.seek(0)
+            if not container.put_archive(workspace, temporary):
+                raise RuntimeError("failed to upload task workspace to Docker sandbox")
+    finally:
+        manifest_path.unlink(missing_ok=True)
 
 
 class TaskSandbox:
@@ -86,15 +123,7 @@ class TaskSandbox:
     def _upload_initial_workspace(self) -> None:
         if not self.container:
             raise RuntimeError("sandbox has not started")
-        with tempfile.NamedTemporaryFile(prefix="cybergym-task-", suffix=".tar") as temporary:
-            with tarfile.open(temporary.name, mode="w") as archive:
-                for entry in sorted(self.task_dir.rglob("*")):
-                    if entry.is_symlink():
-                        continue
-                    archive.add(entry, arcname=str(entry.relative_to(self.task_dir)), recursive=False)
-            temporary.seek(0)
-            if not self.container.put_archive(self.WORKSPACE, temporary):
-                raise RuntimeError("failed to upload task workspace to Docker sandbox")
+        upload_task_workspace(self.task_dir, self.container, self.WORKSPACE)
 
     def _exec(self, command: list[str], *, workdir: str | None = None) -> tuple[int, bytes, bytes]:
         if not self.container:

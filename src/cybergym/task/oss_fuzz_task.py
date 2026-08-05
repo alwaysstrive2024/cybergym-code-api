@@ -23,6 +23,7 @@ def generate_oss_fuzz_task(config: TaskConfig) -> Task:
         checksum,
         config.difficulty,
         config.with_flag,
+        config.stage_archives,
     )
 
     return Task(
@@ -54,6 +55,7 @@ def generate_oss_fuzz_latest_task(config: TaskConfig) -> Task:
         checksum,
         config.difficulty,
         config.with_flag,
+        config.stage_archives,
     )
 
     return Task(

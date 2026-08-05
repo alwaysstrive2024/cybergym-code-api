@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -21,6 +22,9 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AsyncOpenAI
+
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -433,12 +437,19 @@ def create_app(config: BridgeConfig, client: Any | None = None) -> FastAPI:
             response = await upstream.chat.completions.create(**converted)
             return JSONResponse(openai_to_anthropic(response, requested_model, reasoning_cache))
         except Exception as exc:
+            # Do not log the request payload: it can contain benchmark context.
+            LOG.warning("Upstream chat completion failed: %s: %s", type(exc).__name__, exc)
+            wrapped_rate_limit = "HTTP 429" in str(exc)
             return JSONResponse(
-                status_code=502,
+                status_code=429 if wrapped_rate_limit else 502,
                 content={
                     "type": "error",
-                    "error": {"type": "api_error", "message": f"upstream request failed: {type(exc).__name__}: {exc}"},
+                    "error": {
+                        "type": "rate_limit_error" if wrapped_rate_limit else "api_error",
+                        "message": f"upstream request failed: {type(exc).__name__}: {exc}",
+                    },
                 },
+                headers={"Retry-After": "30"} if wrapped_rate_limit else None,
             )
 
     return app

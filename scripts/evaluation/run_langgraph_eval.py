@@ -17,7 +17,6 @@ import os
 import shlex
 import sys
 import tarfile
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -30,7 +29,14 @@ from langgraph.graph import END, START, StateGraph
 from openai import OpenAI
 
 import docker
-from cybergym.agents.context import ContextLedger, compact_messages, estimated_tokens, sanitize_assistant_message
+from cybergym.agents.context import (
+    ContextLedger,
+    compact_messages,
+    estimated_tokens,
+    is_context_overflow_error,
+    sanitize_assistant_message,
+)
+from cybergym.agents.runtime import upload_task_workspace
 from cybergym.task.gen_task import generate_task
 from cybergym.task.mask import mask_task_id
 from cybergym.task.types import TaskConfig, TaskDifficulty
@@ -126,7 +132,7 @@ class EvalConfig:
     max_tokens: int | None
     context_token_budget: int
     temperature: float
-    top_p: float
+    top_p: float | None
     seed: int
     request_timeout: float
     command_timeout: int
@@ -210,15 +216,7 @@ class TaskSandbox:
     def _upload_initial_workspace(self) -> None:
         if not self.container:
             raise RuntimeError("sandbox has not started")
-        with tempfile.NamedTemporaryFile(prefix="cybergym-task-", suffix=".tar") as temporary:
-            with tarfile.open(temporary.name, mode="w") as archive:
-                for entry in sorted(self.task_dir.rglob("*")):
-                    if entry.is_symlink():
-                        continue
-                    archive.add(entry, arcname=str(entry.relative_to(self.task_dir)), recursive=False)
-            temporary.seek(0)
-            if not self.container.put_archive(self.WORKSPACE, temporary):
-                raise RuntimeError("failed to upload task workspace to Docker sandbox")
+        upload_task_workspace(self.task_dir, self.container, self.WORKSPACE)
 
     def _exec(self, command: list[str], *, workdir: str | None = None) -> tuple[int, bytes, bytes]:
         if not self.container:
@@ -671,8 +669,14 @@ def make_graph(client: OpenAI, config: EvalConfig, executor: ToolExecutor) -> An
             )
             request_messages = [*state["messages"], {"role": "user", "content": FINALIZATION_PROMPT}]
             available_tools = finalization_tools
+        tool_schema_tokens = estimated_tokens(available_tools)
+        output_reserve = config.max_tokens if config.max_tokens is not None else 2_048
+        reserved_tokens = tool_schema_tokens + output_reserve
         request_messages, omitted_exchanges = compact_messages(
-            request_messages, config.context_token_budget, executor.context_ledger.render()
+            request_messages,
+            config.context_token_budget,
+            executor.context_ledger.render(),
+            reserved_tokens=reserved_tokens,
         )
         # This is the exact message/tool payload made visible to the provider.
         # Tool results also have their own `event: tool` records.
@@ -685,6 +689,7 @@ def make_graph(client: OpenAI, config: EvalConfig, executor: ToolExecutor) -> An
                 "api_mode": config.api_mode,
                 "context_token_budget": config.context_token_budget,
                 "estimated_input_tokens": sum(estimated_tokens(message) for message in request_messages),
+                "reserved_output_and_tool_tokens": reserved_tokens,
                 "omitted_exchanges": omitted_exchanges,
                 "messages": request_messages,
                 "tools": available_tools,
@@ -700,15 +705,44 @@ def make_graph(client: OpenAI, config: EvalConfig, executor: ToolExecutor) -> An
                 # The submit-only finalization is enforced locally instead.
                 "tool_choice": "auto",
                 "temperature": config.temperature,
-                "top_p": config.top_p,
                 "seed": config.seed,
                 "timeout": config.request_timeout,
             }
+            if config.top_p is not None:
+                request_kwargs["top_p"] = config.top_p
             if config.max_tokens is not None:
                 request_kwargs["max_tokens"] = config.max_tokens
             if config.reasoning_effort:
                 request_kwargs["reasoning_effort"] = config.reasoning_effort
-            completion = client.chat.completions.create(**request_kwargs)
+            try:
+                completion = client.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                if not is_context_overflow_error(exc):
+                    raise
+                static_tokens = sum(estimated_tokens(message) for message in request_messages[:2])
+                emergency_budget = max(
+                    reserved_tokens + static_tokens + 256,
+                    int(config.context_token_budget * 0.65),
+                )
+                emergency_messages, emergency_omitted = compact_messages(
+                    request_messages,
+                    emergency_budget,
+                    executor.context_ledger.render(),
+                    reserved_tokens=reserved_tokens,
+                )
+                request_kwargs["messages"] = emergency_messages
+                request_messages = emergency_messages
+                executor._record(
+                    {
+                        "timestamp": utc_now(),
+                        "event": "context_overflow_recovery",
+                        "api_mode": config.api_mode,
+                        "retry_budget": emergency_budget,
+                        "estimated_input_tokens": sum(estimated_tokens(message) for message in emergency_messages),
+                        "omitted_exchanges": emergency_omitted,
+                    }
+                )
+                completion = client.chat.completions.create(**request_kwargs)
             message = completion.choices[0].message
             payload = message.model_dump(exclude_none=True)
             usage = completion.usage.model_dump() if completion.usage else None
@@ -762,15 +796,37 @@ def make_graph(client: OpenAI, config: EvalConfig, executor: ToolExecutor) -> An
                 ),
                 "timeout": config.request_timeout,
                 "temperature": config.temperature,
-                "top_p": config.top_p,
             }
+            if config.top_p is not None:
+                response_kwargs["top_p"] = config.top_p
             if config.max_tokens is not None:
                 response_kwargs["max_output_tokens"] = config.max_tokens
             if previous_response_id:
                 response_kwargs["previous_response_id"] = previous_response_id
             if config.reasoning_effort:
                 response_kwargs["reasoning"] = {"effort": config.reasoning_effort}
-            completion = client.responses.create(**response_kwargs)
+            try:
+                completion = client.responses.create(**response_kwargs)
+            except Exception as exc:
+                if not previous_response_id or not is_context_overflow_error(exc):
+                    raise
+                response_kwargs.pop("previous_response_id", None)
+                response_kwargs["input"] = [
+                    {
+                        "role": "user",
+                        "content": executor.context_ledger.render(),
+                    }
+                ]
+                previous_response_id = None
+                executor._record(
+                    {
+                        "timestamp": utc_now(),
+                        "event": "context_overflow_recovery",
+                        "api_mode": config.api_mode,
+                        "response_chain_reset": True,
+                    }
+                )
+                completion = client.responses.create(**response_kwargs)
             payload = responses_payload(completion)
             usage = completion.usage.model_dump() if completion.usage else None
             response_id = completion.id
@@ -932,6 +988,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=DEFAULT_TOP_P)
     parser.add_argument(
+        "--omit-top-p",
+        action="store_true",
+        help="Do not send top_p; some providers reject it when temperature is also present.",
+    )
+    parser.add_argument(
         "--max-tool-result-chars",
         type=int,
         default=DEFAULT_MAX_TOOL_RESULT_CHARS,
@@ -991,7 +1052,7 @@ def main() -> int:
         max_tokens=args.max_tokens,
         context_token_budget=args.context_token_budget,
         temperature=args.temperature,
-        top_p=args.top_p,
+        top_p=None if args.omit_top_p else args.top_p,
         seed=args.seed,
         request_timeout=args.request_timeout,
         command_timeout=args.command_timeout,
@@ -1016,6 +1077,7 @@ def main() -> int:
             difficulty=TaskDifficulty.level1,
             agent_id=agent_id,
             mask_map_path=Path("mask_map.json").resolve(),
+            stage_archives=True,
         )
     )
     json_dump(run_dir / "task.json", task.model_dump(mode="json"))

@@ -23,6 +23,22 @@ def estimated_tokens(value: Any) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def is_context_overflow_error(exc: Exception) -> bool:
+    """Recognize common provider-specific context-limit failures without hiding other 400s."""
+    text = str(exc).lower()
+    markers = (
+        "context length",
+        "context_length_exceeded",
+        "maximum context",
+        "max context",
+        "too many tokens",
+        "token limit",
+        "prompt is too long",
+        "input is too long",
+    )
+    return any(marker in text for marker in markers)
+
+
 def clip_text(text: str, limit: int) -> str:
     """Keep both diagnostic ends of a long value while marking the omission."""
     if len(text) <= limit:
@@ -30,6 +46,15 @@ def clip_text(text: str, limit: int) -> str:
     omitted = len(text) - limit
     head = max(1, limit * 3 // 4)
     return f"{text[:head]}\n[… {omitted} chars omitted …]\n{text[-(limit - head):]}"
+
+
+def _append_unique(values: deque[str], entry: str) -> None:
+    """Keep the newest occurrence without spending memory on exact duplicates."""
+    try:
+        values.remove(entry)
+    except ValueError:
+        pass
+    values.append(entry)
 
 
 @dataclass
@@ -62,7 +87,7 @@ class ContextLedger:
         entry = f"Fact: {clip_text(summary, 1_200)}"
         if next_hypothesis:
             entry += f" | Next hypothesis: {clip_text(next_hypothesis, 500)}"
-        self.checkpoints.append(entry)
+        _append_unique(self.checkpoints, entry)
 
     def observe_tool(self, name: str, arguments: dict[str, Any], result: str) -> None:
         """Index recoverable facts only; raw logs stay outside model memory."""
@@ -72,17 +97,18 @@ class ContextLedger:
                 count = int(arguments.get("max_lines", 160))
             except (TypeError, ValueError):
                 start, count = 1, 0
-            self.reads.append(f"{arguments.get('path', '?')}:L{start}-L{start + max(0, count - 1)}")
+            _append_unique(self.reads, f"{arguments.get('path', '?')}:L{start}-L{start + max(0, count - 1)}")
         elif name == "write_file" and not result.startswith("error:"):
             content = str(arguments.get("content", ""))
-            self.writes.append(f"{arguments.get('path', '?')} ({len(content.encode('utf-8'))} bytes)")
+            _append_unique(self.writes, f"{arguments.get('path', '?')} ({len(content.encode('utf-8'))} bytes)")
         elif name == "run_command":
             command = " ".join(str(arguments.get("command", "")).split())
             first_line = result.splitlines()[0] if result else "no output"
-            self.commands.append(f"{clip_text(command, 180)} → {clip_text(first_line, 100)}")
+            _append_unique(self.commands, f"{clip_text(command, 180)} → {clip_text(first_line, 100)}")
         elif name == "submit_poc":
-            self.submissions.append(
-                f"{arguments.get('path', '?')}: {clip_text(' '.join(result.split()), 1_200)}"
+            _append_unique(
+                self.submissions,
+                f"{arguments.get('path', '?')}: {clip_text(' '.join(result.split()), 1_200)}",
             )
 
     def render(self, max_chars: int = 5_000) -> str:
@@ -109,6 +135,24 @@ def _is_memory_message(message: dict[str, Any]) -> bool:
     return message.get("role") == "user" and str(message.get("content", "")).startswith(MEMORY_MARKER)
 
 
+def _without_repeated_static_messages(
+    messages: list[dict[str, Any]], static: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Drop stale memory and exact repeated system messages from stored history."""
+    system_contents = {
+        str(message.get("content", "")) for message in static if message.get("role") == "system"
+    }
+    return [
+        message
+        for message in messages
+        if not _is_memory_message(message)
+        and not (
+            message.get("role") == "system"
+            and str(message.get("content", "")) in system_contents
+        )
+    ]
+
+
 def sanitize_assistant_message(message: dict[str, Any], max_content_chars: int = 8_000) -> dict[str, Any]:
     """Remove obsolete large write payloads after their tool call has completed."""
     clean = copy.deepcopy(message)
@@ -130,7 +174,11 @@ def sanitize_assistant_message(message: dict[str, Any], max_content_chars: int =
 
 
 def compact_messages(
-    messages: list[dict[str, Any]], budget: int, durable_memory: str
+    messages: list[dict[str, Any]],
+    budget: int,
+    durable_memory: str,
+    *,
+    reserved_tokens: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     """Keep protocol-valid recent exchanges and inject the durable evidence index.
 
@@ -141,7 +189,9 @@ def compact_messages(
     static = [message for message in messages[:2] if not _is_memory_message(message)]
     if len(static) < 2:
         raise ValueError("message history must start with system and initial user prompts")
-    available = budget - sum(estimated_tokens(message) for message in static)
+    if reserved_tokens < 0:
+        raise ValueError("reserved_tokens must not be negative")
+    available = budget - reserved_tokens - sum(estimated_tokens(message) for message in static)
     if available <= 0:
         raise ValueError("context-token-budget is too small for the initial task prompt")
 
@@ -152,7 +202,7 @@ def compact_messages(
         memory_messages = [memory]
         available -= memory_cost
 
-    tail = [message for message in messages[2:] if not _is_memory_message(message)]
+    tail = _without_repeated_static_messages(messages[2:], static)
     chunks: list[list[dict[str, Any]]] = []
     index = 0
     while index < len(tail):
@@ -167,8 +217,9 @@ def compact_messages(
     used = 0
     for chunk in reversed(chunks):
         cost = sum(estimated_tokens(message) for message in chunk)
-        if cost <= available - used:
-            kept.append(chunk)
-            used += cost
+        if cost > available - used:
+            break
+        kept.append(chunk)
+        used += cost
     kept.reverse()
     return [*static, *memory_messages, *(message for chunk in kept for message in chunk)], len(chunks) - len(kept)
