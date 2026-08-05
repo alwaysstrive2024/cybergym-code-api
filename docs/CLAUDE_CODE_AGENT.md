@@ -5,10 +5,15 @@ CyberGym API 批次入口支持两种 Agent runtime：
 - `USE_CLAUDE_CODE_AGENT=false`：使用原有 LangGraph Agent；
 - `USE_CLAUDE_CODE_AGENT=true`：使用官方 Claude Code Agent SDK。
 
-Claude Code 模式通过仅监听 `127.0.0.1` 的批次级协议桥，将 Anthropic Messages/SSE
-转换成现有 profile 使用的 OpenAI-compatible Chat Completions。Claude Code 子进程只
-获得临时网关凭证，不获得上游 API key。它只能调用五个 in-process MCP 工具；文件与
-命令操作继续在无网络、降权的 Docker sandbox 中执行。
+Claude Code runtime 还支持 `CLAUDE_CODE_PROVIDER=bridge`（默认，使用 OpenAI-compatible 上游）与
+`CLAUDE_CODE_PROVIDER=anthropic`（直连官方 Anthropic API）。关于上下文、记忆、API 和完整运行命令，见
+[AGENT_CONTEXT_AND_RUNTIME.md](AGENT_CONTEXT_AND_RUNTIME.md)。
+
+当 `CLAUDE_CODE_PROVIDER=bridge` 时，Claude Code runtime 通过仅监听 `127.0.0.1` 的批次级协议桥，
+将 Anthropic Messages/SSE 转换成现有 profile 使用的 OpenAI-compatible Chat Completions。runtime 只获得
+临时网关凭证，不获得上游 API key。`CLAUDE_CODE_PROVIDER=anthropic` 时则跳过桥，使用
+`ANTHROPIC_API_KEY` 直连官方 Anthropic API。两种模式都只能调用六个 in-process MCP 工具；文件与命令操作
+继续在无网络、降权的 Docker sandbox 中执行。
 
 ## 直接启动 DeepSeek smoke test
 

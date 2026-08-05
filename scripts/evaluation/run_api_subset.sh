@@ -28,9 +28,6 @@ report_script="${repo_root}/scripts/evaluation/summarize_api_batch.py"
 
 # shellcheck disable=SC1090
 source "${profile_file}"
-: "${API_BASE_URL:?profile must set API_BASE_URL}"
-: "${API_MODEL:?profile must set API_MODEL}"
-: "${API_KEY_ENV:?profile must set API_KEY_ENV}"
 : "${API_MODE:=chat_completions}"
 : "${API_REQUEST_TIMEOUT_S:=900}"
 : "${API_MAX_STEPS:=40}"
@@ -38,11 +35,31 @@ source "${profile_file}"
 : "${API_TEMPERATURE:=0}"
 : "${API_REQUEST_RETRIES:=0}"
 : "${USE_CLAUDE_CODE_AGENT:=false}"
-[[ -n "${!API_KEY_ENV:-}" ]] || { echo "Required API key environment variable is not set: ${API_KEY_ENV}" >&2; exit 2; }
+: "${CLAUDE_CODE_PROVIDER:=bridge}"
+: "${CLAUDE_CODE_API_KEY_ENV:=ANTHROPIC_API_KEY}"
+: "${CLAUDE_CODE_SESSION_TURN_BUDGET:=12}"
+: "${API_CONTEXT_TOKEN_BUDGET:=24576}"
+: "${API_MAX_TOOL_RESULT_CHARS:=12288}"
+: "${API_RESPONSE_COMPACTION_TURNS:=12}"
 case "${USE_CLAUDE_CODE_AGENT}" in
     true|false) ;;
     *) echo "USE_CLAUDE_CODE_AGENT must be exactly true or false" >&2; exit 2 ;;
 esac
+if [[ "${USE_CLAUDE_CODE_AGENT}" == "false" || "${CLAUDE_CODE_PROVIDER}" == "bridge" ]]; then
+    : "${API_BASE_URL:?profile must set API_BASE_URL}"
+    : "${API_MODEL:?profile must set API_MODEL}"
+    : "${API_KEY_ENV:?profile must set API_KEY_ENV}"
+    [[ -n "${!API_KEY_ENV:-}" ]] || { echo "Required API key environment variable is not set: ${API_KEY_ENV}" >&2; exit 2; }
+elif [[ "${USE_CLAUDE_CODE_AGENT}" == "true" && "${CLAUDE_CODE_PROVIDER}" == "anthropic" ]]; then
+    : "${CLAUDE_CODE_MODEL:?profile must set CLAUDE_CODE_MODEL for official Anthropic mode}"
+    [[ -n "${!CLAUDE_CODE_API_KEY_ENV:-}" ]] || {
+        echo "Required Anthropic API key environment variable is not set: ${CLAUDE_CODE_API_KEY_ENV}" >&2
+        exit 2
+    }
+else
+    echo "CLAUDE_CODE_PROVIDER must be bridge or anthropic" >&2
+    exit 2
+fi
 [[ -x "${repo_root}/.venv/bin/python" ]] || {
     echo "Missing .venv; run: uv sync --extra agent --extra server" >&2
     exit 2
@@ -103,7 +120,7 @@ refresh_report() {
 }
 
 refresh_report
-if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" ]]; then
+if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" && "${CLAUDE_CODE_PROVIDER}" == "bridge" ]]; then
     if [[ "${API_MODE}" != "chat_completions" ]]; then
         echo "Claude Code bridge currently requires API_MODE=chat_completions" >&2
         exit 2
@@ -166,20 +183,37 @@ while IFS= read -r task_id || [[ -n "${task_id}" ]]; do
         mv "${run_dir}" "${archive_dir}"
     fi
     if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" ]]; then
-        echo "Running ${task_id} with Claude Code Agent and ${API_MODEL}"
+        if [[ "${CLAUDE_CODE_PROVIDER}" == "anthropic" ]]; then
+            echo "Running ${task_id} with official Claude Code Agent and ${CLAUDE_CODE_MODEL}"
+        else
+            echo "Running ${task_id} with Claude Code Agent bridge and ${API_MODEL}"
+        fi
     else
         echo "Running ${task_id} with LangGraph Agent and ${API_MODEL}"
     fi
     set +e
     if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" ]]; then
-        env -u "${API_KEY_ENV}" \
-            "${repo_root}/.venv/bin/python" "${repo_root}/scripts/evaluation/run_claude_code_eval.py" \
-            --task-id "${task_id}" --model "${API_MODEL}" \
-            --anthropic-base-url "${claude_bridge_url}" \
-            --data-dir "${data_dir}" --server "${server_url}" --run-root "${task_runs_dir}" \
-            --run-name "${run_name}" --agent-id "${agent_id}" \
-            --max-turns "${API_MAX_STEPS}" --timeout "${API_REQUEST_TIMEOUT_S}" \
-            --differential-submit >>"${task_log}" 2>&1
+        if [[ "${CLAUDE_CODE_PROVIDER}" == "bridge" ]]; then
+            env -u "${API_KEY_ENV}" \
+                "${repo_root}/.venv/bin/python" "${repo_root}/scripts/evaluation/run_claude_code_eval.py" \
+                --task-id "${task_id}" --model "${API_MODEL}" --provider bridge \
+                --anthropic-base-url "${claude_bridge_url}" \
+                --data-dir "${data_dir}" --server "${server_url}" --run-root "${task_runs_dir}" \
+                --run-name "${run_name}" --agent-id "${agent_id}" \
+                --max-turns "${API_MAX_STEPS}" --session-turn-budget "${CLAUDE_CODE_SESSION_TURN_BUDGET}" \
+                --timeout "${API_REQUEST_TIMEOUT_S}" --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
+                --differential-submit >>"${task_log}" 2>&1
+        else
+            env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN \
+                "${repo_root}/.venv/bin/python" "${repo_root}/scripts/evaluation/run_claude_code_eval.py" \
+                --task-id "${task_id}" --model "${CLAUDE_CODE_MODEL}" --provider anthropic \
+                --api-key-env "${CLAUDE_CODE_API_KEY_ENV}" \
+                --data-dir "${data_dir}" --server "${server_url}" --run-root "${task_runs_dir}" \
+                --run-name "${run_name}" --agent-id "${agent_id}" \
+                --max-turns "${API_MAX_STEPS}" --session-turn-budget "${CLAUDE_CODE_SESSION_TURN_BUDGET}" \
+                --timeout "${API_REQUEST_TIMEOUT_S}" --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
+                --differential-submit >>"${task_log}" 2>&1
+        fi
     else
         "${repo_root}/.venv/bin/python" "${repo_root}/scripts/evaluation/run_langgraph_eval.py" \
             --task-id "${task_id}" --model "${API_MODEL}" --base-url "${API_BASE_URL}" \
@@ -187,6 +221,9 @@ while IFS= read -r task_id || [[ -n "${task_id}" ]]; do
             --data-dir "${data_dir}" --server "${server_url}" --run-root "${task_runs_dir}" \
             --run-name "${run_name}" --agent-id "${agent_id}" \
             --max-steps "${API_MAX_STEPS}" --max-tokens "${API_MAX_TOKENS}" \
+            --context-token-budget "${API_CONTEXT_TOKEN_BUDGET}" \
+            --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
+            --response-compaction-turns "${API_RESPONSE_COMPACTION_TURNS}" \
             --temperature "${API_TEMPERATURE}" --seed 20260731 \
             --request-timeout "${API_REQUEST_TIMEOUT_S}" --request-retries "${API_REQUEST_RETRIES}" >>"${task_log}" 2>&1
     fi
