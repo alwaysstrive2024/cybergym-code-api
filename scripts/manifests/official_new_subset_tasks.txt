@@ -1,0 +1,6 @@
+# Fresh, non-overlapping level-1 source subset selected from official tasks.json.
+# It intentionally excludes all ten README-recommended-subset task IDs used earlier.
+arvo:1461
+arvo:65212
+arvo:781
+arvo:1976

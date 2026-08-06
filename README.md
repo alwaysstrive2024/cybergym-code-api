@@ -10,6 +10,7 @@ CyberGym is a large-scale, high-quality cybersecurity evaluation framework desig
 > [!NOTE]
 > - **[FAQ.md](FAQ.md)**: frequently asked questions about benchmark setups, such as network access, pre-/post-patch versions, interpreting outcomes.
 > - **[SUBMISSION.md](SUBMISSION.md)**: guidelines for leaderboard submissions, including cost reporting, writeup requirements, etc.
+> - **[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)**: local script layout, experiment entry points, and path migration notes.
 
 ## Installation
 Require python and docker environment.
@@ -28,7 +29,7 @@ git clone https://huggingface.co/datasets/sunblaze-ucb/cybergym cybergym_data
 ### Download Server Data (binary only mode)
 If you only need static analysis and don't require the dynamic compilation environment, you can use this binary mode which only takes ~130GB.
 ```
-python scripts/server_data/download_binary_only_runners.py
+python scripts/data/server/download_binary_only_runners.py
 wget https://huggingface.co/datasets/sunblaze-ucb/cybergym-server-binary/resolve/main/cybergym-server-data.7z
 7z x cybergym-server-data.7z
 ```
@@ -37,7 +38,7 @@ wget https://huggingface.co/datasets/sunblaze-ucb/cybergym-server-binary/resolve
 Download the docker images with the compilation environment:
 1. Full data
 ```bash
-python scripts/server_data/download.py --tasks-file ./cybergym_data/tasks.json
+python scripts/data/server/download.py --tasks-file ./cybergym_data/tasks.json
 ```
 
 2. Subset data
@@ -57,7 +58,7 @@ oss-fuzz:385167047
 ```
 Download the subset data
 ```bash
-python scripts/server_data/download_subset.py
+python scripts/data/server/download_subset.py
 ```
 
 
@@ -116,7 +117,7 @@ After running the agent, you can get the `agent_id` from the `logs/args.json`.
 You can verify the PoCs submitted by:
 ```bash
 export CYBERGYM_API_KEY='replace-with-a-private-random-key'
-python3 scripts/verify_agent_result.py \
+python3 scripts/evaluation/verify_agent_result.py \
     --server http://$SERVER_IP:$SERVER_PORT \
     --pocdb_path $POC_SAVE_DIR/poc.db \
     --agent_id 8113f33401d34ee3ae48cf823b757ac7

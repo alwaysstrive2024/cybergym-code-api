@@ -6,6 +6,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 DEFAULT_SALT = "CyberGym"
+STAGED_ARCHIVES_MANIFEST = ".cybergym-staged-archives.json"
 
 
 class TaskType(StrEnum):
@@ -42,6 +43,7 @@ class TaskConfig(BaseModel):
     mask_map_path: Path | None = None
     agent_id: str | None = None
     with_flag: bool = False
+    stage_archives: bool = False
 
 
 def verify_task(task_id: str, agent_id: str, checksum: str, salt: str = DEFAULT_SALT) -> bool:

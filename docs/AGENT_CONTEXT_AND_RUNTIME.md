@@ -29,10 +29,16 @@ git diff origin/feature/claude-code-agent-entry...HEAD
 `src/cybergym/agents/runtime.py` 是 Claude Agent SDK 的工具层。
 
 - `read_file` 默认最多 160 行、硬上限 400 行 / 16K 字符，输出带行号；
-- 单个工具结果默认最多 12,288 字符，完整结果保存到 `tool-results/`；
+- 单个工具结果默认最多 12,288 字符；每次调用的完整原始结果保存到 `tool-results/raw/`，确定性清洗结果保存到 `tool-results/processed/`，模型只接收清洗后视图或其有标记的有界版本；
 - 新增 `save_checkpoint(summary, next_hypothesis)`；
+- 新增 `update_investigation_state(...)`，用有上限的结构记录目标、输入路径、崩溃证据、文件状态与重开条件、调用边、受控值、未知项和主/备假设，并同步写入 `investigation-state.json`；
 - 每次工具调用更新 `working-memory.md`；
 - 账本只保存源码范围、已写文件、命令状态、提交回执和 checkpoint，不复制大日志。
+- `read_file` 会隐藏明确识别的文件头许可证/版权或自动生成声明、压缩空行并谨慎折叠大型静态表，所有保留内容继续使用原始行号；函数内部安全注释、TODO/FIXME、约束和被注释代码不会被通用删除。
+- 完整重复读取相同范围时先返回软提醒；新假设、显式 `reopen`、不同范围、此前截断或文件修改会自动放行。
+- `run_command` 对完全相同的 warning 去重、折叠超长十六进制串，并把 Sanitizer 诊断和栈上下文移到模型视图开头，避免关键证据被通用截断丢弃。
+- 清洗后仍超限的 Sanitizer/runtime 和大型 `rg` 结果使用确定性 JSON 证据摘要；配置 `--tool-summary-model` 后，其他复杂超长源码/命令结果才会调用独立总结模型。模型摘要必须提供带 `file:line` 的事实并通过结构校验，否则自动回退 processed 截断视图。
+- 共享探索策略支持 `--policy-mode baseline|guided|enforced`。默认 `guided` 只在读取预算、首次提交截止或假设停滞时追加提示；`enforced` 会阻止新的宽泛浏览，但仍允许带 `hypothesis`、`expected_evidence` 且不超过 80 行的窄读取，以及状态更新、写候选和提交。
 
 ### LangGraph / OpenAI-compatible 后端
 
@@ -170,7 +176,10 @@ manifest 验证。CyberGym 本地验证 server 的管理 key 默认由脚本临�
 
 - `trajectory.jsonl`：模型、SDK、工具和 session reset 事件；
 - `working-memory.md`：后续 session 加载的紧凑事实账本；
-- `tool-results/`：未截断的大型工具输出；
+- `tool-results/raw/`：每次工具调用的未修改原始输出，仅用于审计和人工排查；
+- `tool-results/processed/`：确定性清洗后的完整输出；
+- `tool-results/summaries/`：仅在超限且结构化摘要成功时生成的 JSON；
+- `investigation-state.json`：结构化调查状态；
 - `summary.json`：结束原因与提交记录；
 - `verification.json`：最终 CyberGym 验证。
 
@@ -183,6 +192,16 @@ Next hypothesis: encode -1 length while keeping the enclosing record checksum va
 ```
 
 不要将原始日志、整段源码或无证据长推理写入 checkpoint。
+
+`summary.json` 的 `metrics` 与 trajectory 的 `policy_state`/`submission_outcome` 可直接用于 A/B 聚合，不需要读取工具正文。主要指标包括首次提交步、重复读取率、raw/processed/model-visible 字符量、无效提交、假设修订、策略提示/拦截和上下文超限次数。
+
+可对一个或多个轨迹生成统一 JSON 指标：
+
+```bash
+python scripts/evaluation/summarize_trajectory_metrics.py run-a/trajectory.jsonl run-b/trajectory.jsonl
+```
+
+该工具只解析标准化事件及字符数/计数元数据，不读取 `tool-results/raw/` 或任务实验数据。
 
 ## 建议评测顺序
 

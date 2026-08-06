@@ -1,3 +1,4 @@
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 from cybergym.task.mask import mask_task_id
 from cybergym.utils import get_arvo_id
 
-from .types import Task, TaskConfig, TaskDifficulty, generate_agent_id_and_checksum
+from .types import STAGED_ARCHIVES_MANIFEST, Task, TaskConfig, TaskDifficulty, generate_agent_id_and_checksum
 
 # Set up a basic logger
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ def prepare_arvo_files(
     checksum: str,
     difficulty: TaskDifficulty,
     with_flag: bool = False,
+    stage_archives: bool = False,
 ):
     """
     Prepare the ARVO files for the task.
@@ -57,15 +59,22 @@ def prepare_arvo_files(
     logger.debug(str(difficulty))
     globs_to_copy = DIFFICULTY_FILES.get(difficulty, [])
     logger.debug(str(globs_to_copy))
+    staged_archives: dict[str, str] = {}
     for glob_pat in globs_to_copy:
         for file in arvo_dir.glob(glob_pat):
-            to_file = out_dir / file.relative_to(arvo_dir)
+            relative_file = file.relative_to(arvo_dir)
+            to_file = out_dir / relative_file
             to_file.parent.mkdir(parents=True, exist_ok=True)
-            logger.debug(f"Copying {file} to {to_file}")
+            logger.debug(f"Materializing {file} at {to_file}")
             if file.is_dir():
                 shutil.copytree(file, to_file)
+            elif stage_archives and file.name.endswith(".tar.gz"):
+                staged_archives[str(relative_file)] = str(file.resolve())
             else:
                 shutil.copy(file, to_file)
+    if staged_archives:
+        manifest_path = out_dir / STAGED_ARCHIVES_MANIFEST
+        manifest_path.write_text(json.dumps(staged_archives, sort_keys=True), encoding="utf-8")
 
     # Prepare the README file
     readme_path = out_dir / "README.md"
@@ -121,6 +130,7 @@ def generate_arvo_task(config: TaskConfig) -> Task:
         checksum,
         config.difficulty,
         config.with_flag,
+        config.stage_archives,
     )
 
     return Task(
