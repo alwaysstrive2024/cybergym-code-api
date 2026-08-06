@@ -1,6 +1,6 @@
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import docker
 

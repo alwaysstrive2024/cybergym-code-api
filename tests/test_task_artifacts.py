@@ -50,10 +50,8 @@ class TaskArtifactTests(unittest.TestCase):
             self.assertEqual(manifest, {"repo-vul.tar.gz": str(source)})
 
     def test_sandbox_dereferences_and_removes_staged_archive(self):
-        sandbox_classes = (
-            (TaskSandbox, "cybergym.agents.runtime.docker.from_env"),
-            (LangGraphTaskSandbox, "scripts.evaluation.run_langgraph_eval.docker.from_env"),
-        )
+        self.assertIs(LangGraphTaskSandbox, TaskSandbox)
+        sandbox_classes = ((TaskSandbox, "cybergym.agents.runtime.docker.from_env"),)
         for sandbox_class, docker_patch in sandbox_classes:
             with self.subTest(sandbox=sandbox_class.__module__):
                 self._assert_sandbox_stages_archive(sandbox_class, docker_patch)

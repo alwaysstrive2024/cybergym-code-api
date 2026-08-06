@@ -54,10 +54,29 @@ source "${profile_file}"
 : "${EVAL_MEMORY_BUDGET_GIB:=150}"
 : "${EVAL_MEMORY_RESERVE_PER_TASK_GIB:=8}"
 : "${API_GATEWAY_502_LIMIT:=20}"
+: "${API_PROMPT_CACHE_KEY_MODE:=off}"
+: "${AGENT_POLICY_MODE:=guided}"
+: "${AGENT_READ_CALL_BUDGET:=18}"
+: "${AGENT_SOURCE_CHAR_BUDGET:=120000}"
+: "${AGENT_STALE_TOOL_LIMIT:=6}"
+: "${AGENT_FIRST_SUBMIT_TOOL_DEADLINE:=12}"
+: "${AGENT_TOOL_SUMMARY_MODEL:=}"
 [[ "${EVAL_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_CONCURRENCY must be a positive integer" >&2; exit 2; }
 [[ "${EVAL_MEMORY_BUDGET_GIB}" =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_MEMORY_BUDGET_GIB must be a positive integer" >&2; exit 2; }
 [[ "${EVAL_MEMORY_RESERVE_PER_TASK_GIB}" =~ ^[1-9][0-9]*$ ]] || { echo "EVAL_MEMORY_RESERVE_PER_TASK_GIB must be a positive integer" >&2; exit 2; }
 [[ "${API_GATEWAY_502_LIMIT}" =~ ^[1-9][0-9]*$ ]] || { echo "API_GATEWAY_502_LIMIT must be a positive integer" >&2; exit 2; }
+[[ "${AGENT_READ_CALL_BUDGET}" =~ ^[1-9][0-9]*$ ]] || { echo "AGENT_READ_CALL_BUDGET must be positive" >&2; exit 2; }
+[[ "${AGENT_SOURCE_CHAR_BUDGET}" =~ ^[1-9][0-9]*$ ]] || { echo "AGENT_SOURCE_CHAR_BUDGET must be positive" >&2; exit 2; }
+[[ "${AGENT_STALE_TOOL_LIMIT}" =~ ^[1-9][0-9]*$ ]] || { echo "AGENT_STALE_TOOL_LIMIT must be positive" >&2; exit 2; }
+[[ "${AGENT_FIRST_SUBMIT_TOOL_DEADLINE}" =~ ^[1-9][0-9]*$ ]] || { echo "AGENT_FIRST_SUBMIT_TOOL_DEADLINE must be positive" >&2; exit 2; }
+case "${AGENT_POLICY_MODE}" in
+    baseline|guided|enforced) ;;
+    *) echo "AGENT_POLICY_MODE must be baseline, guided, or enforced" >&2; exit 2 ;;
+esac
+case "${API_PROMPT_CACHE_KEY_MODE}" in
+    off|stable) ;;
+    *) echo "API_PROMPT_CACHE_KEY_MODE must be off or stable" >&2; exit 2 ;;
+esac
 case "${USE_CLAUDE_CODE_AGENT}" in
     true|false) ;;
     *) echo "USE_CLAUDE_CODE_AGENT must be exactly true or false" >&2; exit 2 ;;
@@ -82,6 +101,17 @@ case "${API_OMIT_TOP_P}" in
     *) echo "API_OMIT_TOP_P must be exactly true or false" >&2; exit 2 ;;
 esac
 top_p_args=()
+policy_args=(
+    --policy-mode "${AGENT_POLICY_MODE}"
+    --read-call-budget "${AGENT_READ_CALL_BUDGET}"
+    --source-char-budget "${AGENT_SOURCE_CHAR_BUDGET}"
+    --stale-tool-limit "${AGENT_STALE_TOOL_LIMIT}"
+    --first-submit-tool-deadline "${AGENT_FIRST_SUBMIT_TOOL_DEADLINE}"
+)
+summary_args=()
+if [[ -n "${AGENT_TOOL_SUMMARY_MODEL}" ]]; then
+    summary_args+=(--tool-summary-model "${AGENT_TOOL_SUMMARY_MODEL}")
+fi
 if [[ "${API_OMIT_TOP_P}" == "true" ]]; then
     top_p_args+=(--omit-top-p)
 fi
@@ -251,7 +281,10 @@ if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" && "${CLAUDE_CODE_PROVIDER}" == "brid
         exit 2
     fi
     "${repo_root}/.venv/bin/python" -c 'import claude_agent_sdk' >/dev/null
-    claude_bridge_port="$(${repo_root}/.venv/bin/python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+    claude_bridge_port="${CYBERGYM_CLAUDE_BRIDGE_PORT:-}"
+    if [[ -z "${claude_bridge_port}" ]]; then
+        claude_bridge_port="$(${repo_root}/.venv/bin/python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+    fi
     claude_bridge_url="http://127.0.0.1:${claude_bridge_port}"
     export CYBERGYM_CLAUDE_GATEWAY_TOKEN
     CYBERGYM_CLAUDE_GATEWAY_TOKEN="$(${repo_root}/.venv/bin/python -c 'import secrets; print(secrets.token_urlsafe(32))')"
@@ -259,6 +292,7 @@ if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" && "${CLAUDE_CODE_PROVIDER}" == "brid
     CYBERGYM_UPSTREAM_MODEL="${API_MODEL}" \
     CYBERGYM_UPSTREAM_API_KEY="${!API_KEY_ENV}" \
     CYBERGYM_CLAUDE_GATEWAY_TOKEN="${CYBERGYM_CLAUDE_GATEWAY_TOKEN}" \
+    CYBERGYM_PROMPT_CACHE_KEY_MODE="${API_PROMPT_CACHE_KEY_MODE}" \
         "${repo_root}/.venv/bin/python" -m cybergym.agents.anthropic_bridge \
         --port "${claude_bridge_port}" >"${claude_bridge_log}" 2>&1 &
     claude_bridge_pid=$!
@@ -330,6 +364,7 @@ run_one_task() {
                 --run-name "${run_name}" --agent-id "${agent_id}" \
                 --max-turns "${API_MAX_STEPS}" --session-turn-budget "${CLAUDE_CODE_SESSION_TURN_BUDGET}" \
                 --timeout "${API_REQUEST_TIMEOUT_S}" --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
+                "${policy_args[@]}" "${summary_args[@]}" \
                 --differential-submit >>"${task_log}" 2>&1
         else
             env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN \
@@ -340,6 +375,7 @@ run_one_task() {
                 --run-name "${run_name}" --agent-id "${agent_id}" \
                 --max-turns "${API_MAX_STEPS}" --session-turn-budget "${CLAUDE_CODE_SESSION_TURN_BUDGET}" \
                 --timeout "${API_REQUEST_TIMEOUT_S}" --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
+                "${policy_args[@]}" "${summary_args[@]}" \
                 --differential-submit >>"${task_log}" 2>&1
         fi
     else
@@ -352,6 +388,7 @@ run_one_task() {
             --context-token-budget "${API_CONTEXT_TOKEN_BUDGET}" \
             --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
             --response-compaction-turns "${API_RESPONSE_COMPACTION_TURNS}" \
+            "${policy_args[@]}" "${summary_args[@]}" \
             --temperature "${API_TEMPERATURE}" --seed 20260731 \
             "${top_p_args[@]}" \
             --request-timeout "${API_REQUEST_TIMEOUT_S}" --request-retries "${API_REQUEST_RETRIES}" >>"${task_log}" 2>&1

@@ -5,7 +5,7 @@
 /datasets/
 /data/
 /.binary-eval-download/
-
+/cybergym-server-data/
 # Evaluation artifacts and local service state.
 /out/
 /outputs/
