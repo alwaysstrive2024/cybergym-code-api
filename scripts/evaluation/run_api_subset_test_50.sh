@@ -86,14 +86,18 @@ if [[ "${USE_CLAUDE_CODE_AGENT}" == "false" || "${CLAUDE_CODE_PROVIDER}" == "bri
     : "${API_MODEL:?profile must set API_MODEL}"
     : "${API_KEY_ENV:?profile must set API_KEY_ENV}"
     [[ -n "${!API_KEY_ENV:-}" ]] || { echo "Required API key environment variable is not set: ${API_KEY_ENV}" >&2; exit 2; }
-elif [[ "${USE_CLAUDE_CODE_AGENT}" == "true" && "${CLAUDE_CODE_PROVIDER}" == "anthropic" ]]; then
-    : "${CLAUDE_CODE_MODEL:?profile must set CLAUDE_CODE_MODEL for official Anthropic mode}"
+elif [[ "${USE_CLAUDE_CODE_AGENT}" == "true" && \
+        ( "${CLAUDE_CODE_PROVIDER}" == "anthropic" || "${CLAUDE_CODE_PROVIDER}" == "anthropic_compatible" ) ]]; then
+    : "${CLAUDE_CODE_MODEL:?profile must set CLAUDE_CODE_MODEL for an Anthropic-protocol provider}"
+    if [[ "${CLAUDE_CODE_PROVIDER}" == "anthropic_compatible" ]]; then
+        : "${CLAUDE_CODE_BASE_URL:?profile must set CLAUDE_CODE_BASE_URL for Anthropic-compatible mode}"
+    fi
     [[ -n "${!CLAUDE_CODE_API_KEY_ENV:-}" ]] || {
-        echo "Required Anthropic API key environment variable is not set: ${CLAUDE_CODE_API_KEY_ENV}" >&2
+        echo "Required Claude Code API key environment variable is not set: ${CLAUDE_CODE_API_KEY_ENV}" >&2
         exit 2
     }
 else
-    echo "CLAUDE_CODE_PROVIDER must be bridge or anthropic" >&2
+    echo "CLAUDE_CODE_PROVIDER must be bridge, anthropic, or anthropic_compatible" >&2
     exit 2
 fi
 case "${API_OMIT_TOP_P}" in
@@ -347,6 +351,8 @@ run_one_task() {
     if [[ "${USE_CLAUDE_CODE_AGENT}" == "true" ]]; then
         if [[ "${CLAUDE_CODE_PROVIDER}" == "anthropic" ]]; then
             echo "Running ${task_id} with official Claude Code Agent and ${CLAUDE_CODE_MODEL}"
+        elif [[ "${CLAUDE_CODE_PROVIDER}" == "anthropic_compatible" ]]; then
+            echo "Running ${task_id} with native Claude Code Agent via ${CLAUDE_CODE_BASE_URL} and ${CLAUDE_CODE_MODEL}"
         else
             echo "Running ${task_id} with Claude Code Agent bridge and ${API_MODEL}"
         fi
@@ -366,10 +372,22 @@ run_one_task() {
                 --timeout "${API_REQUEST_TIMEOUT_S}" --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
                 "${policy_args[@]}" "${summary_args[@]}" \
                 --differential-submit >>"${task_log}" 2>&1
-        else
+        elif [[ "${CLAUDE_CODE_PROVIDER}" == "anthropic" ]]; then
             env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN \
                 "${repo_root}/.venv/bin/python" "${repo_root}/scripts/evaluation/run_claude_code_eval.py" \
                 --task-id "${task_id}" --model "${CLAUDE_CODE_MODEL}" --provider anthropic \
+                --api-key-env "${CLAUDE_CODE_API_KEY_ENV}" \
+                --data-dir "${data_dir}" --server "${server_url}" --run-root "${task_runs_dir}" \
+                --run-name "${run_name}" --agent-id "${agent_id}" \
+                --max-turns "${API_MAX_STEPS}" --session-turn-budget "${CLAUDE_CODE_SESSION_TURN_BUDGET}" \
+                --timeout "${API_REQUEST_TIMEOUT_S}" --max-tool-result-chars "${API_MAX_TOOL_RESULT_CHARS}" \
+                "${policy_args[@]}" "${summary_args[@]}" \
+                --differential-submit >>"${task_log}" 2>&1
+        else
+            env -u ANTHROPIC_AUTH_TOKEN \
+                "${repo_root}/.venv/bin/python" "${repo_root}/scripts/evaluation/run_claude_code_eval.py" \
+                --task-id "${task_id}" --model "${CLAUDE_CODE_MODEL}" --provider anthropic_compatible \
+                --anthropic-base-url "${CLAUDE_CODE_BASE_URL}" \
                 --api-key-env "${CLAUDE_CODE_API_KEY_ENV}" \
                 --data-dir "${data_dir}" --server "${server_url}" --run-root "${task_runs_dir}" \
                 --run-name "${run_name}" --agent-id "${agent_id}" \

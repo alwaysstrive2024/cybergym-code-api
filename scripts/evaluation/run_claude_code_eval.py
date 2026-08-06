@@ -75,7 +75,7 @@ class ClaudeCodeEvalConfig:
     task_id: str
     model: str
     agent_backend: str
-    provider: Literal["anthropic", "bridge"]
+    provider: Literal["anthropic", "anthropic_compatible", "bridge"]
     anthropic_base_url: str | None
     api_key_env: str | None
     gateway_token_env: str
@@ -295,9 +295,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--provider", choices=("anthropic", "bridge"), default="bridge")
-    parser.add_argument("--anthropic-base-url", help="Bridge URL; required only with --provider bridge.")
-    parser.add_argument("--api-key-env", default="ANTHROPIC_API_KEY", help="Official Anthropic API key environment variable.")
+    parser.add_argument(
+        "--provider", choices=("anthropic", "anthropic_compatible", "bridge"), default="bridge"
+    )
+    parser.add_argument(
+        "--anthropic-base-url",
+        help="Anthropic-protocol endpoint; required with --provider bridge or anthropic_compatible.",
+    )
+    parser.add_argument(
+        "--api-key-env", default="ANTHROPIC_API_KEY", help="Anthropic-protocol API key environment variable."
+    )
     parser.add_argument("--gateway-token-env", default="CYBERGYM_CLAUDE_GATEWAY_TOKEN")
     parser.add_argument("--data-dir", required=True, type=Path)
     parser.add_argument("--server", required=True)
@@ -474,10 +481,12 @@ def main() -> int:
             raise RuntimeError(f"environment variable {args.gateway_token_env} is required")
         api_key = None
     else:
+        if args.provider == "anthropic_compatible" and not args.anthropic_base_url:
+            raise ValueError("--anthropic-base-url is required with --provider anthropic_compatible")
         gateway_token = None
         api_key = os.environ.get(args.api_key_env)
         if not api_key:
-            raise RuntimeError(f"environment variable {args.api_key_env} is required with --provider anthropic")
+            raise RuntimeError(f"environment variable {args.api_key_env} is required with --provider {args.provider}")
 
     agent_id = args.agent_id or uuid4().hex
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -500,7 +509,7 @@ def main() -> int:
         agent_backend="claude_code",
         provider=args.provider,
         anthropic_base_url=args.anthropic_base_url,
-        api_key_env=args.api_key_env if args.provider == "anthropic" else None,
+        api_key_env=args.api_key_env if args.provider != "bridge" else None,
         gateway_token_env=args.gateway_token_env,
         data_dir=str(args.data_dir.resolve()),
         server=args.server,
@@ -546,8 +555,11 @@ def main() -> int:
     sandbox = TaskSandbox(task_dir, args.sandbox_image, args.command_timeout)
     summary_provider = None
     if args.tool_summary_model:
+        summary_base_url = (
+            "https://api.anthropic.com" if args.provider == "anthropic" else args.anthropic_base_url
+        )
         summary_provider = make_anthropic_http_summarizer(
-            base_url=args.anthropic_base_url if args.provider == "bridge" else "https://api.anthropic.com",
+            base_url=summary_base_url,
             model=args.tool_summary_model,
             api_key=api_key,
             auth_token=gateway_token,
@@ -590,8 +602,16 @@ def main() -> int:
                 "ANTHROPIC_CUSTOM_HEADERS": f"X-Cybergym-Session-ID: {session_id}",
             }
         )
-    else:
+    elif args.provider == "anthropic":
         sdk_env["ANTHROPIC_API_KEY"] = api_key or ""
+    else:
+        sdk_env.update(
+            {
+                "ANTHROPIC_BASE_URL": args.anthropic_base_url.rstrip("/"),
+                "ANTHROPIC_API_KEY": api_key or "",
+                "ANTHROPIC_AUTH_TOKEN": "",
+            }
+        )
     mcp_server = create_cybergym_mcp_server(executor)
     options = ClaudeAgentOptions(
         model=args.model,
